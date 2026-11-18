@@ -35,8 +35,9 @@ const MAX_SLIPPAGE_BPS = 100;
 
 const BPS = 10000n;
 
-// Closes of the bars seen so far, newest last, as raw price units.
-const closes: bigint[] = [];
+// Closes of the bars seen so far, newest last, each with the batch seq that
+// carried it, so the dip window can be checked for gaps.
+const closes: { price: bigint; seq: number }[] = [];
 // Fill price of the open position, null when flat.
 let entryPrice: bigint | null = null;
 // Batch seq at which the open position filled.
@@ -53,9 +54,15 @@ await runBars({
   onBatch(state: BarsState, batch: Batch) {
     if (state.warmingUp) return [];
 
-    // Keep the close history current.
+    // Keep the close history current. A batch can arrive with no bar for our
+    // symbol (the recorder took no sample that minute), so note whether this
+    // batch actually carried a fresh close.
+    let freshBar = false;
     for (const bar of batch.bars) {
-      if (bar.symbol === SYMBOL) closes.push(BigInt(bar.c));
+      if (bar.symbol === SYMBOL) {
+        closes.push({ price: BigInt(bar.c), seq: state.seq });
+        freshBar = true;
+      }
     }
     if (closes.length > DIP_BARS + 1) closes.splice(0, closes.length - (DIP_BARS + 1));
 
@@ -99,9 +106,19 @@ await runBars({
     }
 
     // Entry: a sharp dip over the last DIP_BARS bars, after the cooldown.
+    // Never enter on a stale close: if this batch carried no fresh bar for
+    // our symbol, the dip is measured on old data and the bounce may already
+    // be gone. Exits above still run on the last known close, which is the
+    // protective direction.
     if (closes.length < DIP_BARS + 1) return [];
+    if (!freshBar) return [];
     if (state.seq - lastExitSeq < COOLDOWN_BARS) return [];
-    const dip = bpsMove(closes[0], close);
+    // The dip only means something over a contiguous window: if bars went
+    // missing inside the lookback, the oldest close is older than DIP_BARS
+    // minutes and a 40 bp move over that longer stretch is a weaker signal.
+    // Skip the entry until the window is contiguous again.
+    if (state.seq - closes[0].seq !== DIP_BARS) return [];
+    const dip = bpsMove(closes[0].price, close);
     if (dip > -DIP_BPS) return [];
 
     const scale = BigInt(state.hello.capital.quote_scale);
